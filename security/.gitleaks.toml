@@ -1,0 +1,43 @@
+# Конфигурация gitleaks для OrderFlow Platform.
+# Используется в CI: gitleaks/gitleaks-action с GITLEAKS_CONFIG=security/.gitleaks.toml
+# Проверка локально: gitleaks dir . --config security/.gitleaks.toml --redact --exit-code 1
+title = "OrderFlow Platform gitleaks config"
+
+[extend]
+# Правила по умолчанию (AWS/GCP/Slack/Stripe и т.д.) + локальные ниже.
+useDefault = true
+
+[[rules]]
+id = "orderflow-github-token"
+description = "GitHub-токены (PAT, Actions, GHCR) в коде и конфигах"
+regex = '''(?i)gh[pousr]_[A-Za-z0-9_]{30,}'''
+tags = ["github", "token", "ci"]
+
+[[rules]]
+id = "orderflow-private-key"
+description = "Приватные ключи, попавшие в репозиторий"
+regex = '''-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----'''
+tags = ["key", "private-key"]
+
+[[rules]]
+id = "orderflow-database-url-with-password"
+description = "Строки подключения к БД с паролем (postgresql://user:pass@)"
+regex = '''(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://[^\s:'"]+:[^\s'"]+@[^\s'"]+'''
+tags = ["database", "credential"]
+
+[allowlist]
+description = "Намеренно вымышленные значения: документация, примеры, TEST-NET адреса"
+paths = [
+    '''\.env\.example$''',
+    '''docs/.*''',
+    '''README\.md$''',
+    '''deploy/inventory\.example\.ini$''',
+    '''security/SECURITY\.md$''',
+]
+regexes = [
+    '''change-me''',
+    '''CHANGE-ME''',
+    '''example\.com''',
+    '''203\.0\.113\.\d+''',
+    '''postgresql\+asyncpg://orderflow:orderflow@localhost''',
+]

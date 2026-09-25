@@ -1,0 +1,233 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  lint:
+    name: "stage 1 · lint (ruff)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . -r requirements-dev.txt
+
+      - name: Ruff lint
+        run: python -m ruff check .
+
+      - name: Ruff format check
+        run: python -m ruff format --check .
+
+  typecheck:
+    name: "stage 2 · typecheck (mypy)"
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . -r requirements-dev.txt
+
+      - name: Mypy strict
+        run: python -m mypy app
+
+  test:
+    name: "stage 3 · test (pytest)"
+    needs: typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . -r requirements-dev.txt
+
+      - name: Tests with coverage (gate 75%)
+        run: python -m pytest --cov=app --cov-report=xml --cov-report=term-missing --cov-fail-under=75
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+  security:
+    name: "stage 4 · security (bandit · pip-audit · gitleaks)"
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . -r requirements-dev.txt
+
+      - name: Static analysis (bandit)
+        run: python -m bandit -c pyproject.toml -r app -q
+
+      - name: Dependency audit (pip-audit)
+        run: python -m pip-audit --strict --progress-bar off
+
+      - name: Secret scan (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: security/.gitleaks.toml
+
+  build:
+    name: "stage 5 · build (docker) + smoke"
+    needs: security
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: orderflow
+          POSTGRES_PASSWORD: orderflow
+          POSTGRES_DB: orderflow
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U orderflow"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://orderflow:orderflow@host.docker.internal:5432/orderflow
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Normalize image name (GHCR требует lowercase)
+        run: |
+          OWNER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "IMAGE_NAME=ghcr.io/${OWNER}/orderflow-platform-api" >> "$GITHUB_ENV"
+
+      - name: Build image
+        run: docker build -f infra/Dockerfile -t "$IMAGE_NAME:${{ github.sha }}" .
+
+      - name: Apply migrations
+        run: |
+          docker run --rm \
+            --add-host=host.docker.internal:host-gateway \
+            -e DATABASE_URL="$DATABASE_URL" \
+            "$IMAGE_NAME:${{ github.sha }}" alembic upgrade head
+
+      - name: Start container
+        run: |
+          docker run -d --name api \
+            --add-host=host.docker.internal:host-gateway \
+            -e DATABASE_URL="$DATABASE_URL" \
+            -p 8000:8000 \
+            "$IMAGE_NAME:${{ github.sha }}"
+
+      - name: Smoke test (health / ready / metrics)
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8000/health > /dev/null; then
+              echo "api is up after ${i} attempt(s)"
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS http://localhost:8000/health
+          curl -fsS http://localhost:8000/ready
+          curl -fsS http://localhost:8000/metrics | grep -q 'http_requests_total'
+          docker logs api
+
+      - name: Login to GitHub Container Registry
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE_NAME:${{ github.sha }}"
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            docker tag "$IMAGE_NAME:${{ github.sha }}" "$IMAGE_NAME:${GITHUB_REF#refs/tags/}"
+            docker push "$IMAGE_NAME:${GITHUB_REF#refs/tags/}"
+          fi
+
+  deploy:
+    name: "stage 6 · deploy (production)"
+    needs: build
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://orderflow.example.com
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare SSH access to production
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+
+      - name: Deploy release
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ vars.DEPLOY_USER || 'deploy' }}
+          SSH_KEY_PATH: ~/.ssh/deploy_key
+          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || github.sha }}
+        run: bash ./deploy/deploy.sh

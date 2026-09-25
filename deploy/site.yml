@@ -1,0 +1,166 @@
+---
+# Деплой OrderFlow Platform: docker compose стек + nginx + certbot.
+#
+#   ansible-playbook -i deploy/inventory.ini deploy/site.yml
+#
+# Секреты (postgres_password, grafana_admin_password) держите в
+# group_vars/all.yml, зашифрованном через ansible-vault.
+- name: Deploy OrderFlow Platform
+  hosts: orderflow
+  become: true
+  vars:
+    deploy_dir: /opt/orderflow
+    compose_file: "{{ deploy_dir }}/infra/docker-compose.prod.yml"
+    compose_cmd: >-
+      docker compose --project-directory {{ deploy_dir }}
+      -f {{ compose_file }} -p orderflow
+    domain: orderflow.example.com
+    certbot_email: ops@example.com
+    image_tag: latest
+    postgres_user: orderflow
+    postgres_password: "CHANGE-ME-USE-ANSIBLE-VAULT"
+    grafana_admin_user: admin
+    grafana_admin_password: "CHANGE-ME-USE-ANSIBLE-VAULT"
+    stack_files:
+      - infra/docker-compose.prod.yml
+      - infra/nginx/default.conf
+      - observability/prometheus/prometheus.yml
+      - observability/prometheus/rules.yml
+      - observability/grafana/dashboard.json
+      - observability/grafana/alerts.yml
+      - observability/grafana/provisioning/datasources/prometheus.yml
+      - observability/grafana/provisioning/dashboards/provider.yml
+
+  tasks:
+    - name: Install runtime packages
+      ansible.builtin.apt:
+        name:
+          - docker.io
+          - docker-compose-v2
+          - curl
+          - openssl
+          - certbot
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Ensure docker daemon is enabled and running
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Ensure deploy user exists
+      ansible.builtin.user:
+        name: "{{ deploy_user }}"
+        system: true
+        create_home: false
+
+    - name: Create deploy directory
+      ansible.builtin.file:
+        path: "{{ deploy_dir }}"
+        state: directory
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: "0755"
+
+    - name: Create webroot for ACME challenges
+      ansible.builtin.file:
+        path: "{{ deploy_dir }}/certbot-www"
+        state: directory
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: "0755"
+
+    - name: Deploy compose stack and monitoring configs
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../{{ item }}"
+        dest: "{{ deploy_dir }}/{{ item }}"
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: "0644"
+      loop: "{{ stack_files }}"
+      notify: Restart edge proxy
+
+    - name: Write server-side environment file
+      ansible.builtin.copy:
+        dest: "{{ deploy_dir }}/.env"
+        owner: "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+        mode: "0600"
+        content: |
+          POSTGRES_USER={{ postgres_user }}
+          POSTGRES_PASSWORD={{ postgres_password }}
+          GRAFANA_ADMIN_USER={{ grafana_admin_user }}
+          GRAFANA_ADMIN_PASSWORD={{ grafana_admin_password }}
+          GHCR_IMAGE=ghcr.io/alexgoster/orderflow-platform-api
+          IMAGE_TAG={{ image_tag }}
+          DOMAIN={{ domain }}
+      no_log: true
+
+    - name: Bootstrap self-signed certificate so nginx can start
+      ansible.builtin.command:
+        cmd: >-
+          openssl req -x509 -nodes -newkey rsa:2048 -days 30
+          -subj /CN={{ domain }}
+          -keyout /etc/letsencrypt/live/{{ domain }}/privkey.pem
+          -out /etc/letsencrypt/live/{{ domain }}/fullchain.pem
+        creates: "/etc/letsencrypt/live/{{ domain }}/fullchain.pem"
+
+    - name: Issue/renew Let's Encrypt certificate (webroot)
+      ansible.builtin.command:
+        cmd: >-
+          certbot certonly --webroot -w {{ deploy_dir }}/certbot-www
+          --email {{ certbot_email }} --agree-tos --no-eff-email
+          --cert-name {{ domain }} -d {{ domain }}
+        creates: "/etc/letsencrypt/renewal/{{ domain }}.conf"
+
+    - name: Reload edge proxy to pick up fresh certificates
+      ansible.builtin.command:
+        cmd: "{{ compose_cmd }} exec -T nginx nginx -s reload"
+      changed_when: true
+      failed_when: false
+
+    - name: Pull container images
+      ansible.builtin.command:
+        cmd: "{{ compose_cmd }} pull"
+      environment:
+        IMAGE_TAG: "{{ image_tag }}"
+      changed_when: true
+
+    - name: Apply database migrations
+      ansible.builtin.command:
+        cmd: "{{ compose_cmd }} run --rm migrate"
+      environment:
+        IMAGE_TAG: "{{ image_tag }}"
+      changed_when: true
+
+    - name: Start the stack
+      ansible.builtin.command:
+        cmd: "{{ compose_cmd }} up -d --remove-orphans"
+      environment:
+        IMAGE_TAG: "{{ image_tag }}"
+      changed_when: true
+
+    - name: Wait until readiness endpoint returns 200
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8000/ready
+        status_code: 200
+        timeout: 10
+      register: readiness
+      retries: 15
+      delay: 2
+      until: readiness.status == 200
+
+    - name: Show stack status
+      ansible.builtin.command:
+        cmd: "{{ compose_cmd }} ps"
+      changed_when: false
+
+  handlers:
+    - name: Restart edge proxy
+      ansible.builtin.command:
+        cmd: "{{ compose_cmd }} restart nginx"
+      environment:
+        IMAGE_TAG: "{{ image_tag }}"
+      changed_when: true

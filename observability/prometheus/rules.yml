@@ -1,0 +1,49 @@
+# Алерты Prometheus для OrderFlow Platform.
+# Ожидаемые имена: HighErrorRate, HighP95Latency, ApiDown (см. docs/SLO.md).
+groups:
+  - name: orderflow-api
+    interval: 30s
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          (
+            sum(rate(http_requests_total{status=~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total[5m]))
+          ) > 0.05
+          and
+          sum(rate(http_requests_total[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "Доля 5xx-ответов выше 5% (SLO 99.5% под угрозой)"
+          description: "Более 5% запросов завершаются 5xx на протяжении 5 минут. Проверь последние релизы и логи по request_id."
+          runbook: "docs/RUNBOOK.md#1-высокая-ошибка-или-просадка-p95"
+
+      - alert: HighP95Latency
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(http_request_duration_seconds_bucket[5m]))
+          ) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "p95 латентности выше 200 мс (SLO)"
+          description: "p95 > 200 мс дольше 10 минут. Смотри панель Latency, slow-запросы и нагрузку на БД."
+          runbook: "docs/RUNBOOK.md#1-высокая-ошибка-или-просадка-p95"
+
+      - alert: ApiDown
+        expr: up{job="api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "Цель api не отвечает на /metrics"
+          description: "Prometheus не может собрать метрики api 2 минуты — контейнер упал или завис. Проверь docker ps и health-check."
+          runbook: "docs/RUNBOOK.md#2-упавший-api"

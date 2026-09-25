@@ -1,0 +1,42 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Virtual envs
+.venv/
+venv/
+
+# Env & secrets
+.env
+*.pem
+*.key
+id_ed25519
+*.p12
+
+# Coverage
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Local databases & release state
+*.db
+smoke.db
+.release-version
+.previous-version
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+
+# Ansible
+deploy/inventory.ini
+deploy/*.retry

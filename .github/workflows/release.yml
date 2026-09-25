@@ -1,0 +1,142 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  build:
+    name: "release · build + smoke"
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: orderflow
+          POSTGRES_PASSWORD: orderflow
+          POSTGRES_DB: orderflow
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U orderflow"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://orderflow:orderflow@host.docker.internal:5432/orderflow
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Normalize image name (GHCR требует lowercase)
+        run: |
+          OWNER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "IMAGE_NAME=ghcr.io/${OWNER}/orderflow-platform-api" >> "$GITHUB_ENV"
+
+      - name: Build image
+        run: docker build -f infra/Dockerfile -t "$IMAGE_NAME:$RELEASE_TAG" .
+
+      - name: Apply migrations
+        run: |
+          docker run --rm \
+            --add-host=host.docker.internal:host-gateway \
+            -e DATABASE_URL="$DATABASE_URL" \
+            "$IMAGE_NAME:$RELEASE_TAG" alembic upgrade head
+
+      - name: Smoke test image
+        run: |
+          set -euo pipefail
+          docker run -d --name api \
+            --add-host=host.docker.internal:host-gateway \
+            -e DATABASE_URL="$DATABASE_URL" \
+            -p 8000:8000 \
+            "$IMAGE_NAME:$RELEASE_TAG"
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8000/health > /dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS http://localhost:8000/health
+          curl -fsS http://localhost:8000/ready
+          curl -fsS http://localhost:8000/metrics | grep -q 'http_requests_total'
+          curl -fsS http://localhost:8000/api/v1/flags > /dev/null
+          docker logs api
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push release image
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE_NAME:$RELEASE_TAG"
+          docker tag "$IMAGE_NAME:$RELEASE_TAG" "$IMAGE_NAME:latest"
+          docker push "$IMAGE_NAME:latest"
+
+  deploy:
+    name: "release · deploy"
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://orderflow.example.com
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare SSH access to production
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+
+      - name: Deploy release
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ vars.DEPLOY_USER || 'deploy' }}
+          SSH_KEY_PATH: ~/.ssh/deploy_key
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: bash ./deploy/deploy.sh
+
+  github-release:
+    name: "release · github release notes"
+    needs: [build, deploy]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            echo "release $RELEASE_TAG already exists"
+          else
+            gh release create "$RELEASE_TAG" \
+              --title "OrderFlow Platform $RELEASE_TAG" \
+              --generate-notes \
+              --verify-tag
+          fi
