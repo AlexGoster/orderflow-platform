@@ -110,7 +110,7 @@ jobs:
         run: python -m bandit -c pyproject.toml -r app -q
 
       - name: Dependency audit (pip-audit)
-        run: python -m pip-audit --strict --progress-bar off
+        run: python -m pip_audit --strict .
 
       - name: Secret scan (gitleaks)
         uses: gitleaks/gitleaks-action@v2
@@ -213,7 +213,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check deploy target configured
+        id: check
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SSH_HOST" ]; then
+            echo "SSH_HOST не задан (секреты окружения production не настроены) — деплой пропущен"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Prepare SSH access to production
+        if: steps.check.outputs.skip == 'false'
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_KEY: ${{ secrets.SSH_KEY }}
@@ -225,6 +239,7 @@ jobs:
           ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
 
       - name: Deploy release
+        if: steps.check.outputs.skip == 'false'
         env:
           SSH_HOST: ${{ secrets.SSH_HOST }}
           SSH_USER: ${{ vars.DEPLOY_USER || 'deploy' }}
