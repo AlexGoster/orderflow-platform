@@ -1,5 +1,7 @@
 # OrderFlow Platform
 
+[Проверенный запуск и ограничения](VERIFICATION.md).
+
 [![CI](https://github.com/AlexGoster/orderflow-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/AlexGoster/orderflow-platform/actions/workflows/ci.yml)
 [![Security](https://img.shields.io/badge/security-gitleaks%20%C2%B7%20bandit%20%C2%B7%20pip--audit-2ea44f)](security/SECURITY.md)
 [![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)](#тесты-и-гейты)

@@ -36,7 +36,7 @@ dev = [
 ]
 
 [project.scripts]
-orderflow-api = "app.main:app"
+orderflow-api = "app.main:run"
 
 [tool.setuptools.packages.find]
 include = ["app*"]
